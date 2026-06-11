@@ -1,0 +1,21 @@
+# Demo workload with realistic misconfigurations (runs as root, allows
+# privilege escalation). Benign image — the point is how it's deployed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  labels: { app: demo-app }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: demo-app }
+  template:
+    metadata:
+      labels: { app: demo-app }
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.25-alpine
+          securityContext:
+            runAsUser: 0                   # misconfig: root
+            allowPrivilegeEscalation: true # misconfig: priv-esc allowed

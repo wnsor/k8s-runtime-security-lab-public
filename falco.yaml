@@ -1,0 +1,113 @@
+# Falco deployed as a DaemonSet (one agent per node) — no Helm.
+# It watches kernel syscalls through eBPF and prints a JSON alert when a rule
+# matches. Everything Falco needs lives in this one file: a namespace, a
+# service account, its config + rules (a ConfigMap), and the DaemonSet.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: falco
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: falco
+  namespace: falco
+# No RBAC needed: Falco identifies containers from the kernel (cgroups), and the
+# responder resolves pods client-side with your kubeconfig — neither needs RBAC.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-config
+  namespace: falco
+data:
+  # ---- Falco's main config ------------------------------------------------
+  falco.yaml: |
+    # Load ONLY our custom rules. We deliberately do not load Falco's ~100
+    # default rules so the demo stays focused: in a Kubernetes cluster those
+    # would fire constantly (on Falco's own privileged pod, kube-system, etc.)
+    # and bury the two detections this lab is about.
+    rules_files:
+      - /etc/falco/custom_rules.yaml
+
+    json_output: true            # so responder.py can parse alerts as JSON
+    buffered_outputs: false      # flush each alert immediately (live `make respond`)
+    stdout_output:
+      enabled: true              # alerts show up in `kubectl logs`
+    log_level: info
+
+    engine:
+      kind: modern_ebpf          # CO-RE eBPF, built into the binary (needs kernel >= 5.8).
+                                 # If the pod CrashLoops with a scap_init error, it's usually
+                                 # an old-Falco / new-kernel mismatch — bump the image tag
+                                 # below to the latest Falco rather than switching drivers.
+
+  # ---- Our two custom rules (self-contained) ------------------------------
+  custom_rules.yaml: |
+    # We define the handful of macros/lists we use, so this file does not
+    # depend on Falco's bundled ruleset being present in the image.
+    - macro: container
+      condition: container.id != host
+
+    - macro: spawned_process
+      condition: evt.type in (execve, execveat) and evt.dir = <
+
+    - macro: open_read
+      condition: evt.type in (open, openat, openat2) and evt.is_open_read = true and fd.typechar = 'f'
+
+    - list: shell_binaries
+      items: [ash, bash, csh, dash, ksh, sh, tcsh, zsh]
+
+    - rule: Shell Opened In Container
+      desc: A shell process was spawned inside a running container.
+      condition: spawned_process and container and proc.name in (shell_binaries)
+      output: "Shell opened in container (container=%container.id cmd=%proc.cmdline)"
+      priority: WARNING
+      tags: [container, shell, mitre_execution]
+
+    - rule: Sensitive File Read In Container
+      desc: A process read a sensitive file such as /etc/shadow inside a container.
+      condition: open_read and container and fd.name in (/etc/shadow, /etc/sudoers)
+      output: "Sensitive file read in container (container=%container.id file=%fd.name cmd=%proc.cmdline)"
+      priority: WARNING
+      tags: [container, filesystem, mitre_credential_access]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco
+  namespace: falco
+  labels: { app: falco }
+spec:
+  selector:
+    matchLabels: { app: falco }
+  template:
+    metadata:
+      labels: { app: falco }
+    spec:
+      serviceAccountName: falco
+      hostPID: true              # so Falco can see host processes
+      # A node security agent should run on every node, including tainted
+      # control-plane nodes — which is the *only* node in a default kind cluster.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: falco
+          image: falcosecurity/falco:0.40.0
+          securityContext:
+            privileged: true     # required to load the eBPF probe and read host syscalls
+          env:
+            - name: HOST_ROOT
+              value: /host       # tells Falco where the host filesystem is mounted
+            - name: SKIP_DRIVER_LOADER
+              value: "yes"       # modern_ebpf is built into the binary; skip the falcoctl
+                                 # driver-loader (it tries to write our read-only config)
+          volumeMounts:
+            - { name: config, mountPath: /etc/falco/falco.yaml, subPath: falco.yaml }
+            - { name: config, mountPath: /etc/falco/custom_rules.yaml, subPath: custom_rules.yaml }
+            - { name: proc, mountPath: /host/proc, readOnly: true }
+            - { name: modules, mountPath: /host/lib/modules, readOnly: true }
+      volumes:
+        - { name: config, configMap: { name: falco-config } }
+        - { name: proc, hostPath: { path: /proc } }
+        - { name: modules, hostPath: { path: /lib/modules } }
